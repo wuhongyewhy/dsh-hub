@@ -155,6 +155,16 @@ function sessionUser(req) {
   return user;
 }
 
+function stripTabSessionFromReferer(req) {
+  try {
+    const referer = new URL(req.headers.referer);
+    if (referer.searchParams.has(TAB_SESSION_QUERY)) {
+      referer.searchParams.delete(TAB_SESSION_QUERY);
+      req.headers.referer = referer.toString();
+    }
+  } catch { /* absent or non-URL Referer */ }
+}
+
 function makeTabSession(user) {
   const exp = Date.now() + CFG.sessionTtlMs;
   const nonce = crypto.randomBytes(12).toString('base64url');
@@ -562,9 +572,9 @@ try{Object.defineProperty(crypto,'randomUUID',{value:uuid4,writable:true,configu
 catch(e){try{crypto.randomUUID=uuid4;}catch(e2){}}
 })();</script>`;
 
-// Cookies are shared by every tab in a browser profile. Give each tab its own
-// signed session token in sessionStorage and attach it to same-origin requests.
-// The Hub strips these credentials before forwarding requests to dsh.
+// Cookies are shared by every tab in a browser profile. Keep each tab's signed
+// session in sessionStorage and its URL so document refreshes preserve identity;
+// attach it to same-origin requests, then strip it before forwarding to dsh.
 const TAB_SESSION_SNIPPET = `<script>(function(){
 var storageKey='${TAB_SESSION_STORAGE_KEY}';
 var headerName='${TAB_SESSION_HEADER}';
@@ -572,8 +582,39 @@ var queryName='${TAB_SESSION_QUERY}';
 function readToken(){try{return sessionStorage.getItem(storageKey)||'';}catch(e){return '';}}
 function writeToken(value){try{if(value)sessionStorage.setItem(storageKey,value);else sessionStorage.removeItem(storageKey);}catch(e){}}
 function sameOrigin(value){try{return new URL(value instanceof Request?value.url:value,location.href).origin===location.origin;}catch(e){return false;}}
+try{var urlToken=new URL(location.href).searchParams.get(queryName);if(urlToken)writeToken(urlToken);}catch(e){}
+function withTabUrl(value){
+  try{
+    var parsed=new URL(value,location.href);
+    if(parsed.origin!==location.origin||/^\/hub\/(?:login|tab-login|logout)(?:\/|$)/.test(parsed.pathname))return value;
+    var token=readToken();if(token)parsed.searchParams.set(queryName,token);
+    return parsed.pathname+parsed.search+parsed.hash;
+  }catch(e){return value;}
+}
+function keepTokenInAddress(){
+  var token=readToken();if(!token)return;
+  try{
+    var parsed=new URL(location.href);
+    if(parsed.searchParams.get(queryName)===token)return;
+    parsed.searchParams.set(queryName,token);
+    history.replaceState(history.state,'',parsed.pathname+parsed.search+parsed.hash);
+  }catch(e){}
+}
 if(!window.__dshHubTabSessionWrapped){
   window.__dshHubTabSessionWrapped=true;
+  var nativePushState=history.pushState,nativeReplaceState=history.replaceState;
+  history.pushState=function(){var args=Array.prototype.slice.call(arguments);if(args.length>2&&args[2]!=null)args[2]=withTabUrl(args[2]);return nativePushState.apply(this,args);};
+  history.replaceState=function(){var args=Array.prototype.slice.call(arguments);if(args.length>2&&args[2]!=null)args[2]=withTabUrl(args[2]);return nativeReplaceState.apply(this,args);};
+  document.addEventListener('click',function(e){
+    var node=e.target;if(node&&node.nodeType===3)node=node.parentElement;
+    var anchor=node&&node.closest?node.closest('a[href]'):null;
+    if(anchor){var next=withTabUrl(anchor.href);if(next!==anchor.href)anchor.href=next;}
+  },true);
+  document.addEventListener('submit',function(e){var form=e.target;if(form&&form.action){var next=withTabUrl(form.action);if(next!==form.action)form.action=next;}},true);
+  if(typeof window.open==='function'){
+    var nativeOpen=window.open;
+    window.open=function(url){var args=Array.prototype.slice.call(arguments);if(args.length&&url)args[0]=withTabUrl(url);return nativeOpen.apply(this,args);};
+  }
   if(typeof window.fetch==='function'){
     var nativeFetch=window.fetch;
     window.fetch=function(input,init){
@@ -608,10 +649,21 @@ if(!window.__dshHubTabSessionWrapped){
     try{Object.setPrototypeOf(HubWebSocket,NativeWebSocket);}catch(e){}
     window.WebSocket=HubWebSocket;
   }
+  if(window.EventSource){
+    var NativeEventSource=window.EventSource;
+    function HubEventSource(url,options){return new NativeEventSource(withTabUrl(url),options);}
+    HubEventSource.prototype=NativeEventSource.prototype;
+    try{Object.setPrototypeOf(HubEventSource,NativeEventSource);}catch(e){}
+    window.EventSource=HubEventSource;
+  }
+  if(navigator.sendBeacon){
+    var nativeSendBeacon=navigator.sendBeacon.bind(navigator);
+    navigator.sendBeacon=function(url,data){return nativeSendBeacon(withTabUrl(url),data);};
+  }
 }
 window.__dshHubTabSessionReady=fetch('/hub/me',{credentials:'same-origin',cache:'no-store',headers:{Accept:'application/json'}})
   .then(function(r){if(!r.ok)throw new Error('session lookup failed');return r.json();})
-  .then(function(data){if(data&&typeof data.tabSession==='string'&&data.tabSession)writeToken(data.tabSession);else if(readToken())writeToken('');return data;})
+  .then(function(data){if(data&&typeof data.tabSession==='string'&&data.tabSession){writeToken(data.tabSession);keepTokenInAddress();}else if(readToken())writeToken('');return data;})
   .catch(function(){return null;});
 })();</script>`;
 
@@ -789,6 +841,7 @@ proxy.on('proxyRes', (proxyRes, req, res) => {
     delete headers['etag'];
     delete headers['last-modified'];
     headers['cache-control'] = 'no-store';
+    headers['referrer-policy'] = 'no-referrer';
     res.writeHead(proxyRes.statusCode, headers);
     const html = Buffer.concat(chunks).toString('utf-8');
     const injected = /<head[^>]*>/i.test(html)
@@ -906,7 +959,7 @@ const TAB_LOGIN_PAGE = `<!doctype html>
     var button=form.querySelector('button');button.disabled=true;error.textContent='';
     fetch('/hub/tab-login',{method:'POST',credentials:'same-origin',cache:'no-store',headers:{'Content-Type':'application/x-www-form-urlencoded','Accept':'application/json'},body:new URLSearchParams(new FormData(form)).toString()})
       .then(function(r){return r.json().then(function(data){if(!r.ok)throw new Error(data.error||'登录失败');return data;});})
-      .then(function(data){sessionStorage.setItem('${TAB_SESSION_STORAGE_KEY}',data.tabSession);form.querySelector('[type=password]').value='';var back='/';try{var saved=sessionStorage.getItem('dsh-hub-tab-return');if(saved&&saved.charAt(0)==='/'&&saved.slice(0,2)!=='//')back=saved;sessionStorage.removeItem('dsh-hub-tab-return');}catch(e){}location.replace(back);})
+      .then(function(data){var token=data.tabSession;sessionStorage.setItem('${TAB_SESSION_STORAGE_KEY}',token);form.querySelector('[type=password]').value='';var back='/';try{var saved=sessionStorage.getItem('dsh-hub-tab-return');var target=new URL(saved&&saved.charAt(0)==='/'&&saved.slice(0,2)!=='//'?saved:'/',location.origin);if(target.origin===location.origin){target.searchParams.set('${TAB_SESSION_QUERY}',token);back=target.pathname+target.search+target.hash;}sessionStorage.removeItem('dsh-hub-tab-return');}catch(e){}location.replace(back);})
       .catch(function(err){error.textContent=err.message||'登录失败';button.disabled=false;});
   });
 })();
@@ -1201,6 +1254,10 @@ function prewarmSessionList(user, be) {
 
 async function route(req, res) {
   const url = new URL(req.url, 'http://x');
+  const tabTokens = url.searchParams.getAll(TAB_SESSION_QUERY);
+  if (tabTokens.length && !req.headers[TAB_SESSION_HEADER]) {
+    req.headers[TAB_SESSION_HEADER] = tabTokens.length === 1 ? tabTokens[0] : 'invalid';
+  }
   url.searchParams.delete(TAB_SESSION_QUERY);
   req.url = `${url.pathname}${url.search}`;
 
@@ -1248,6 +1305,7 @@ async function route(req, res) {
     handleLogout(req, res);
     return;
   }
+  stripTabSessionFromReferer(req);
   delete req.headers[TAB_SESSION_HEADER];
 
   // Session-list RPC cache: serve the last known snapshot forever (serve-stale),
@@ -1368,7 +1426,9 @@ const server = http.createServer((req, res) => {
 server.on('upgrade', (req, socket, head) => {
   const url = new URL(req.url, 'http://x');
   const tabTokens = url.searchParams.getAll(TAB_SESSION_QUERY);
-  if (tabTokens.length) req.headers[TAB_SESSION_HEADER] = tabTokens.length === 1 ? tabTokens[0] : 'invalid';
+  if (tabTokens.length && !req.headers[TAB_SESSION_HEADER]) {
+    req.headers[TAB_SESSION_HEADER] = tabTokens.length === 1 ? tabTokens[0] : 'invalid';
+  }
   url.searchParams.delete(TAB_SESSION_QUERY);
   req.url = `${url.pathname}${url.search}`;
   const user = sessionUser(req);
@@ -1377,6 +1437,7 @@ server.on('upgrade', (req, socket, head) => {
     socket.destroy();
     return;
   }
+  stripTabSessionFromReferer(req);
   delete req.headers[TAB_SESSION_HEADER];
   const be = backends.get(user);
   if (!be || !be.child || be.child.exitCode !== null) {
