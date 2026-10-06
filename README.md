@@ -1,5 +1,37 @@
 # dsh-hub
 
+## Fork-specific changes / 本 Fork 的修改
+
+This fork is based on [Mpaperlee/dsh-hub](https://github.com/Mpaperlee/dsh-hub) and adds the following changes.
+
+本 Fork 基于上游 [Mpaperlee/dsh-hub](https://github.com/Mpaperlee/dsh-hub)，增加和调整了以下功能。
+
+### Runtime and authentication / 运行与认证
+
+- **Authenticated DSH startup / DSH 启动认证:** The Hub captures DSH's short-lived launch URL, validates it, exchanges its one-time token for a backend session cookie, and redacts the token from logs.
+  Hub 捕获并校验 DSH 的短时启动 URL，用一次性令牌换取后端会话 Cookie，并在日志中隐藏令牌。
+- **Per-user proxy cookies / 按用户转发 Cookie:** The matching user's backend Cookie is forwarded with that user's HTTP and WebSocket requests.
+  代理会在该用户的 HTTP 和 WebSocket 请求中转发对应后端 Cookie。
+- **Session-list cache / 会话列表缓存:** Valid session-list responses are persisted; cached results are served quickly while background refresh keeps them current.
+  有效的会话列表响应会持久缓存，先快速返回缓存结果，再由后台刷新。
+- **Backend lifecycle / 后端生命周期:** Concurrent startup requests share one readiness wait, and shutdown stops child backends and removes their firewall guards.
+  并发启动请求会等待同一个就绪流程；服务退出时会停止子后端并清理防火墙规则。
+
+### Draggable user badge / 可拖动用户徽标
+
+Set `HUB_USER_BADGE=1` to show a badge with the signed-in username and a “Switch user” link. The username comes from `/hub/me`; the link opens `/hub/logout`. Drag it with a mouse or touch, and its position is saved in the browser.
+
+设置 `HUB_USER_BADGE=1` 后，会显示当前用户名和“切换用户”入口。用户名由 `/hub/me` 按当前会话读取，入口跳转到 `/hub/logout`。徽标支持鼠标或触屏拖动，位置保存在浏览器中。
+
+### Optional Unsloth key / 可选 Unsloth 密钥
+
+When `/var/lib/dsh-hub/unsloth-api-key` exists, its contents are passed to child DSH processes as `DSH_UNSLOTH_API_KEY`. The key file is not part of this repository and should remain root-only.
+
+如果 `/var/lib/dsh-hub/unsloth-api-key` 存在，Hub 会将其内容作为 `DSH_UNSLOTH_API_KEY` 传给子 DSH 进程。密钥文件不属于本仓库，应仅允许 root 访问。
+
+---
+
+
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Node](https://img.shields.io/badge/node-%E2%89%A520-green.svg)](https://nodejs.org)
 [![Platform](https://img.shields.io/badge/platform-linux-lightgrey.svg)](#)
