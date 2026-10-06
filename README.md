@@ -14,6 +14,8 @@ This fork is based on [Mpaperlee/dsh-hub](https://github.com/Mpaperlee/dsh-hub) 
   代理会在该用户的 HTTP 和 WebSocket 请求中转发对应后端 Cookie。
 - **Per-tab users / 标签页独立用户:** Each browser tab keeps its own signed Hub session in `sessionStorage` and a URL marker so full-page refreshes preserve its identity. Switching accounts in one tab does not change the others. The Hub removes the marker before forwarding requests to dsh and sends a no-referrer policy.
   每个浏览器标签页在 `sessionStorage` 中保存独立签名会话，并通过 URL 标记保证整页刷新后身份不变。在一个标签页切换账号不会影响其他标签页。Hub 转发给 dsh 前会移除该标记，并设置禁止发送来源页地址的策略。
+  Both `/hub/login` and `/hub/tab-login` use this tab-local login flow. The first login seeds a cookie for browser-native static assets; switching tabs' accounts keeps that cookie. Documents, HTTP API calls and WebSockets use each tab's signed session.
+  `/hub/login` 和 `/hub/tab-login` 都使用标签页独立登录。首次登录为浏览器原生静态资源请求建立 Cookie，切换标签页账号时保留它。页面、HTTP API 和 WebSocket 请求按各标签页的签名会话路由。
 - **Session-list cache / 会话列表缓存:** Valid session-list responses are persisted; cached results are served quickly while background refresh keeps them current.
   有效的会话列表响应会持久缓存，先快速返回缓存结果，再由后台刷新。
 - **Backend lifecycle / 后端生命周期:** Concurrent startup requests share one readiness wait, and shutdown stops child backends and removes their firewall guards.

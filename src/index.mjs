@@ -575,7 +575,7 @@ catch(e){try{crypto.randomUUID=uuid4;}catch(e2){}}
 // Cookies are shared by every tab in a browser profile. Keep each tab's signed
 // session in sessionStorage and its URL so document refreshes preserve identity;
 // attach it to same-origin requests, then strip it before forwarding to dsh.
-const TAB_SESSION_SNIPPET = `<script>(function(){
+const TAB_SESSION_SNIPPET = String.raw`<script>(function(){
 var storageKey='${TAB_SESSION_STORAGE_KEY}';
 var headerName='${TAB_SESSION_HEADER}';
 var queryName='${TAB_SESSION_QUERY}';
@@ -878,43 +878,6 @@ function sendJson(res, status, body) {
   res.end(JSON.stringify(body));
 }
 
-const LOGIN_PAGE = `<!doctype html>
-<html lang="zh">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>dsh-hub login</title>
-<style>
-  :root { color-scheme: dark; }
-  body { font-family: system-ui, sans-serif; background: #101418; color: #e6e6e6;
-         display: flex; align-items: center; justify-content: center; height: 100vh; margin: 0; }
-  .card { background: #1a2027; padding: 2.2rem 2.6rem; border-radius: 12px; width: 22rem;
-          box-shadow: 0 8px 40px rgba(0,0,0,.45); }
-  h1 { font-size: 1.25rem; margin: 0 0 .3rem; }
-  p.sub { color: #8b97a3; font-size: .85rem; margin: 0 0 1.6rem; }
-  label { display: block; font-size: .8rem; color: #8b97a3; margin: .9rem 0 .25rem; }
-  input { width: 100%; box-sizing: border-box; padding: .55rem .7rem; border-radius: 8px;
-          border: 1px solid #2c3641; background: #101418; color: inherit; font-size: .95rem; }
-  button { margin-top: 1.5rem; width: 100%; padding: .6rem; border: 0; border-radius: 8px;
-           background: #3b82f6; color: #fff; font-size: .95rem; cursor: pointer; }
-  button:hover { background: #2f6fe0; }
-  .err { color: #f87171; font-size: .85rem; min-height: 1.2em; margin-top: 1rem; }
-</style>
-</head>
-<body>
-  <form class="card" method="post" action="/hub/login">
-    <h1>DeepSeek Harness</h1>
-    <p class="sub">使用服务器系统账号登录(每用户独立隔离实例)</p>
-    <label for="u">用户名</label>
-    <input id="u" name="username" autocomplete="username" autofocus required>
-    <label for="p">密码</label>
-    <input id="p" name="password" type="password" autocomplete="current-password" required>
-    <div class="err">__MSG__</div>
-    <button type="submit">登录</button>
-  </form>
-</body>
-</html>`;
-
 const TAB_LOGIN_PAGE = `<!doctype html>
 <html lang="zh">
 <head>
@@ -954,12 +917,20 @@ const TAB_LOGIN_PAGE = `<!doctype html>
 <script>
 (function(){
   var form=document.getElementById('tab-login-form'),error=document.getElementById('tab-login-error');
+  function returnUrl(token){
+    var saved='';try{saved=sessionStorage.getItem('dsh-hub-tab-return')||'';}catch(e){}
+    var target=new URL(saved.charAt(0)==='/'&&saved.slice(0,2)!=='//'?saved:'/',location.origin);
+    if(target.origin!==location.origin)target=new URL('/',location.origin);
+    if(token)target.searchParams.set('${TAB_SESSION_QUERY}',token);else target.searchParams.delete('${TAB_SESSION_QUERY}');
+    return target.pathname+target.search+target.hash;
+  }
+  try{document.querySelector('.back').href=returnUrl(sessionStorage.getItem('${TAB_SESSION_STORAGE_KEY}'));}catch(e){}
   form.addEventListener('submit',function(e){
     e.preventDefault();
     var button=form.querySelector('button');button.disabled=true;error.textContent='';
     fetch('/hub/tab-login',{method:'POST',credentials:'same-origin',cache:'no-store',headers:{'Content-Type':'application/x-www-form-urlencoded','Accept':'application/json'},body:new URLSearchParams(new FormData(form)).toString()})
       .then(function(r){return r.json().then(function(data){if(!r.ok)throw new Error(data.error||'登录失败');return data;});})
-      .then(function(data){var token=data.tabSession;sessionStorage.setItem('${TAB_SESSION_STORAGE_KEY}',token);form.querySelector('[type=password]').value='';var back='/';try{var saved=sessionStorage.getItem('dsh-hub-tab-return');var target=new URL(saved&&saved.charAt(0)==='/'&&saved.slice(0,2)!=='//'?saved:'/',location.origin);if(target.origin===location.origin){target.searchParams.set('${TAB_SESSION_QUERY}',token);back=target.pathname+target.search+target.hash;}sessionStorage.removeItem('dsh-hub-tab-return');}catch(e){}location.replace(back);})
+      .then(function(data){var token=data.tabSession;sessionStorage.setItem('${TAB_SESSION_STORAGE_KEY}',token);form.querySelector('[type=password]').value='';var back=returnUrl(token);sessionStorage.removeItem('dsh-hub-tab-return');location.replace(back);})
       .catch(function(err){error.textContent=err.message||'登录失败';button.disabled=false;});
   });
 })();
@@ -991,33 +962,6 @@ function urlencoded(body) {
   return { username: params.get('username') ?? '', password: params.get('password') ?? '' };
 }
 
-async function handleLogin(req, res) {
-  const ip = clientIp(req);
-  if (rateLimited(ip)) {
-    sendHtml(res, 429, LOGIN_PAGE.replace('__MSG__', '尝试过多,请 1 分钟后再试'));
-    return;
-  }
-  const { username, password } = urlencoded(await readBody(req));
-  if (!username || !password) {
-    sendHtml(res, 401, LOGIN_PAGE.replace('__MSG__', '请输入用户名和密码'));
-    return;
-  }
-  const info = lookupUser(username);
-  const ok = info && await pamAuthenticate(username, password)
-    && !(CFG.allowUsers.length && !CFG.allowUsers.includes(username));
-  if (!ok) {
-    recordFailure(ip);
-    sendHtml(res, 401, LOGIN_PAGE.replace('__MSG__', '用户名或密码错误'));
-    return;
-  }
-  const token = makeCookie(username);
-  res.writeHead(303, {
-    'set-cookie': `${CFG.cookieName}=${token}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${Math.floor(CFG.sessionTtlMs / 1000)}`,
-    location: '/',
-  });
-  res.end();
-}
-
 async function handleTabLogin(req, res) {
   const ip = clientIp(req);
   if (rateLimited(ip)) {
@@ -1036,6 +980,14 @@ async function handleTabLogin(req, res) {
     recordFailure(ip);
     sendJson(res, 401, { error: '用户名或密码错误' });
     return;
+  }
+  // Native script/style requests cannot carry JavaScript-added tab headers.
+  // Seed a cookie for those assets once; account switches keep the cookie while
+  // document, HTTP API and WebSocket routing use the signed per-tab session.
+  const cookieUser = sessionUser({ headers: { cookie: req.headers.cookie } });
+  if (!cookieUser || !lookupUser(cookieUser)) {
+    const token = makeCookie(username);
+    res.setHeader('set-cookie', `${CFG.cookieName}=${token}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${Math.floor(CFG.sessionTtlMs / 1000)}`);
   }
   sendJson(res, 200, { user: username, tabSession: makeTabSession(username) });
 }
@@ -1261,25 +1213,15 @@ async function route(req, res) {
   url.searchParams.delete(TAB_SESSION_QUERY);
   req.url = `${url.pathname}${url.search}`;
 
-  if (url.pathname === '/hub/login' && req.method === 'GET') {
-    sendHtml(res, 200, LOGIN_PAGE.replace('__MSG__', ''));
-    return;
-  }
-  if (url.pathname === '/hub/tab-login' && req.method === 'GET') {
-    sendHtml(res, 200, TAB_LOGIN_PAGE, { 'cache-control': 'no-store' });
-    return;
-  }
-  if (url.pathname === '/hub/tab-login' && req.method === 'POST') {
-    await handleTabLogin(req, res);
-    return;
-  }
-  if (url.pathname === '/hub/tab-login') {
-    res.writeHead(405, { allow: 'GET, POST' });
-    res.end('Method Not Allowed');
-    return;
-  }
-  if (url.pathname === '/hub/login' && req.method === 'POST') {
-    await handleLogin(req, res);
+  if (url.pathname === '/hub/login' || url.pathname === '/hub/tab-login') {
+    if (req.method === 'GET') {
+      sendHtml(res, 200, TAB_LOGIN_PAGE, { 'cache-control': 'no-store' });
+    } else if (req.method === 'POST') {
+      await handleTabLogin(req, res);
+    } else {
+      res.writeHead(405, { allow: 'GET, POST' });
+      res.end('Method Not Allowed');
+    }
     return;
   }
   if (url.pathname === '/hub/me' && req.method === 'GET') {
