@@ -1,12 +1,12 @@
 // dsh-hub — a JupyterHub-style front for DeepSeek Harness (dsh).
 //
 // Architecture (mirrors JupyterHub):
-//   Authenticator  — PAM (system accounts), login page, HMAC-signed session cookie
+//   Authenticator  — PAM (system accounts), login page, HMAC-signed cookie and per-tab sessions
 //   Spawner        — on first authenticated request, spawn `dsh web --port <N>`
 //                    as that OS user (uid/gid), with DSH_HOME isolated per user,
 //                    plus an iptables loopback owner-guard so OTHER local users
 //                    cannot reach the unauthenticated dsh port.
-//   Proxy          — routes HTTP + WebSocket by session cookie to the user's backend
+//   Proxy          — routes HTTP + WebSocket by cookie or per-tab session to the user's backend
 //                    (single shared hostname; no path rewriting needed).
 //   Culler         — stops idle backends after IDLE_CULL_MS and removes guards.
 //
@@ -93,6 +93,10 @@ const CFG = {
   logDir: process.env.HUB_LOG_DIR ?? '/var/log/dsh-hub',
 };
 
+const TAB_SESSION_HEADER = 'x-dsh-hub-session';
+const TAB_SESSION_QUERY = '__dsh_hub_session';
+const TAB_SESSION_STORAGE_KEY = 'dsh-hub-tab-session-v1';
+
 const IS_ROOT = process.getuid?.() === 0;
 const IPTABLES = IS_ROOT && hasBin('iptables');
 
@@ -136,6 +140,8 @@ function parseCookie(req) {
 }
 
 function sessionUser(req) {
+  const tabSession = req.headers[TAB_SESSION_HEADER];
+  if (typeof tabSession === 'string' && tabSession) return parseTabSession(tabSession);
   const val = parseCookie(req);
   if (!val) return null;
   const m = /^(.+)\.(\d+)\.(.+)$/.exec(val);
@@ -145,6 +151,27 @@ function sessionUser(req) {
   if (!Number.isFinite(exp) || exp < Date.now()) return null;
   const expect = sign(user, exp);
   const a = Buffer.from(sig), b = Buffer.from(expect);
+  if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) return null;
+  return user;
+}
+
+function makeTabSession(user) {
+  const exp = Date.now() + CFG.sessionTtlMs;
+  const nonce = crypto.randomBytes(12).toString('base64url');
+  const payload = `${user}.${exp}.${nonce}`;
+  const sig = crypto.createHmac('sha256', SECRET).update(`tab.${payload}`).digest('base64url');
+  return `${payload}.${sig}`;
+}
+
+function parseTabSession(token) {
+  const m = /^([a-z_][a-z0-9_-]{0,31})\.(\d+)\.([A-Za-z0-9_-]{16})\.([A-Za-z0-9_-]{43})$/i.exec(token);
+  if (!m) return null;
+  const [, user, expStr, nonce, sig] = m;
+  const exp = Number(expStr);
+  if (!Number.isFinite(exp) || exp < Date.now()) return null;
+  const payload = `${user}.${exp}.${nonce}`;
+  const expected = crypto.createHmac('sha256', SECRET).update(`tab.${payload}`).digest('base64url');
+  const a = Buffer.from(sig), b = Buffer.from(expected);
   if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) return null;
   return user;
 }
@@ -535,6 +562,59 @@ try{Object.defineProperty(crypto,'randomUUID',{value:uuid4,writable:true,configu
 catch(e){try{crypto.randomUUID=uuid4;}catch(e2){}}
 })();</script>`;
 
+// Cookies are shared by every tab in a browser profile. Give each tab its own
+// signed session token in sessionStorage and attach it to same-origin requests.
+// The Hub strips these credentials before forwarding requests to dsh.
+const TAB_SESSION_SNIPPET = `<script>(function(){
+var storageKey='${TAB_SESSION_STORAGE_KEY}';
+var headerName='${TAB_SESSION_HEADER}';
+var queryName='${TAB_SESSION_QUERY}';
+function readToken(){try{return sessionStorage.getItem(storageKey)||'';}catch(e){return '';}}
+function writeToken(value){try{if(value)sessionStorage.setItem(storageKey,value);else sessionStorage.removeItem(storageKey);}catch(e){}}
+function sameOrigin(value){try{return new URL(value instanceof Request?value.url:value,location.href).origin===location.origin;}catch(e){return false;}}
+if(!window.__dshHubTabSessionWrapped){
+  window.__dshHubTabSessionWrapped=true;
+  if(typeof window.fetch==='function'){
+    var nativeFetch=window.fetch;
+    window.fetch=function(input,init){
+      var token=readToken();
+      if(!token||!sameOrigin(input)||(input instanceof Request&&input.mode==='no-cors')||(init&&init.mode==='no-cors'))return nativeFetch.apply(this,arguments);
+      var headers=new Headers(input instanceof Request?input.headers:undefined);
+      if(init&&init.headers)new Headers(init.headers).forEach(function(v,k){headers.set(k,v);});
+      headers.set(headerName,token);
+      return nativeFetch.call(this,input,Object.assign({},init||{},{headers:headers}));
+    };
+  }
+  if(window.XMLHttpRequest){
+    var xhrOpen=XMLHttpRequest.prototype.open,xhrSend=XMLHttpRequest.prototype.send;
+    XMLHttpRequest.prototype.open=function(method,url){this.__dshHubSameOrigin=sameOrigin(url);return xhrOpen.apply(this,arguments);};
+    XMLHttpRequest.prototype.send=function(){var token=readToken();if(token&&this.__dshHubSameOrigin)try{this.setRequestHeader(headerName,token);}catch(e){}return xhrSend.apply(this,arguments);};
+  }
+  if(window.WebSocket){
+    var NativeWebSocket=window.WebSocket;
+    function HubWebSocket(url,protocols){
+      var token=readToken(),target=url;
+      if(token)try{
+        var parsed=new URL(url,location.href);
+        if(parsed.host===location.host&&(parsed.protocol==='ws:'||parsed.protocol==='wss:'||parsed.protocol==='http:'||parsed.protocol==='https:')){
+          if(parsed.protocol==='http:')parsed.protocol='ws:';
+          if(parsed.protocol==='https:')parsed.protocol='wss:';
+          parsed.searchParams.set(queryName,token);target=parsed.href;
+        }
+      }catch(e){}
+      return protocols===undefined?new NativeWebSocket(target):new NativeWebSocket(target,protocols);
+    }
+    HubWebSocket.prototype=NativeWebSocket.prototype;
+    try{Object.setPrototypeOf(HubWebSocket,NativeWebSocket);}catch(e){}
+    window.WebSocket=HubWebSocket;
+  }
+}
+window.__dshHubTabSessionReady=fetch('/hub/me',{credentials:'same-origin',cache:'no-store',headers:{Accept:'application/json'}})
+  .then(function(r){if(!r.ok)throw new Error('session lookup failed');return r.json();})
+  .then(function(data){if(data&&typeof data.tabSession==='string'&&data.tabSession)writeToken(data.tabSession);else if(readToken())writeToken('');return data;})
+  .catch(function(){return null;});
+})();</script>`;
+
 const USER_BADGE_SNIPPET = CFG.userBadge ? `<style id="dsh-hub-user-badge-style">
 #dsh-hub-user-badge{position:fixed!important;left:12px;top:12px;right:auto!important;bottom:auto!important;z-index:2147483647!important;display:flex;flex-direction:column;align-items:stretch;gap:0;padding:4px;border:1px solid rgba(15,23,42,.12);border-radius:12px;background:rgba(255,255,255,.96);box-shadow:0 3px 12px rgba(15,23,42,.1);backdrop-filter:blur(10px);cursor:grab;touch-action:none;user-select:none;-webkit-user-select:none}
 #dsh-hub-user-badge.dsh-hub-dragging{cursor:grabbing}
@@ -557,7 +637,8 @@ function mount(){
   if(badge){if(badge.parentNode!==document.body)document.body.appendChild(badge);return true;}
   badge=document.createElement('div');badge.id=id;
   badge.title='按住徽章拖动可移动位置';
-  var link=document.createElement('a');link.href='/hub/logout';link.textContent='切换\\n用户';
+  var link=document.createElement('a');link.href='/hub/tab-login';link.textContent='切换\\n用户';
+  link.addEventListener('click',function(){try{sessionStorage.setItem('dsh-hub-tab-return',location.pathname+location.search+location.hash);}catch(e){}});
   var label=document.createElement('span');label.hidden=true;label.setAttribute('aria-label','当前用户名');
   badge.appendChild(link);badge.appendChild(label);document.body.appendChild(badge);
 
@@ -618,8 +699,7 @@ function mount(){
   },true);
   window.addEventListener('resize',keepVisible);
 
-  fetch('/hub/me',{credentials:'same-origin',cache:'no-store',headers:{Accept:'application/json'}})
-    .then(function(r){if(!r.ok)throw new Error('session lookup failed');return r.json();})
+  Promise.resolve(window.__dshHubTabSessionReady)
     .then(function(data){if(data&&typeof data.user==='string'&&data.user){label.textContent=data.user;label.hidden=false;keepVisible();}})
     .catch(function(){});
   return true;
@@ -642,7 +722,7 @@ observer.observe(document.documentElement,{childList:true,subtree:true});
 //   → isLoopback: true,
 //
 // The trust boundary moves to the hub exactly like origin-rewrite: the PAM
-// session cookie decides who reaches the backend at all. The patch is
+// session cookie or signed tab session decides who reaches the backend at all. The patch is
 // pattern-based against the unminified bundle and FAILS LOUD (startup log) if
 // upstream renames the expression, so upgrades surface immediately instead of
 // silently regressing settings.
@@ -712,8 +792,8 @@ proxy.on('proxyRes', (proxyRes, req, res) => {
     res.writeHead(proxyRes.statusCode, headers);
     const html = Buffer.concat(chunks).toString('utf-8');
     const injected = /<head[^>]*>/i.test(html)
-      ? html.replace(/<head[^>]*>/i, (m) => m + RANDOM_UUID_POLYFILL + USER_BADGE_SNIPPET)
-      : RANDOM_UUID_POLYFILL + USER_BADGE_SNIPPET + html;
+      ? html.replace(/<head[^>]*>/i, (m) => m + RANDOM_UUID_POLYFILL + TAB_SESSION_SNIPPET + USER_BADGE_SNIPPET)
+      : RANDOM_UUID_POLYFILL + TAB_SESSION_SNIPPET + USER_BADGE_SNIPPET + html;
     res.end(Buffer.from(injected, 'utf-8'));
   });
 });
@@ -733,6 +813,16 @@ proxy.on('error', (err, req, res) => {
 function sendHtml(res, status, body, headers = {}) {
   res.writeHead(status, { 'content-type': 'text/html; charset=utf-8', ...headers });
   res.end(body);
+}
+
+function sendJson(res, status, body) {
+  res.writeHead(status, {
+    'content-type': 'application/json; charset=utf-8',
+    'cache-control': 'no-store, no-cache, must-revalidate, private',
+    pragma: 'no-cache',
+    expires: '0',
+  });
+  res.end(JSON.stringify(body));
 }
 
 const LOGIN_PAGE = `<!doctype html>
@@ -769,6 +859,58 @@ const LOGIN_PAGE = `<!doctype html>
     <div class="err">__MSG__</div>
     <button type="submit">登录</button>
   </form>
+</body>
+</html>`;
+
+const TAB_LOGIN_PAGE = `<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<title>切换当前标签页用户</title>
+<style>
+  :root { color-scheme: dark; }
+  body { font-family: system-ui, sans-serif; background: #101418; color: #e6e6e6;
+         display: flex; align-items: center; justify-content: center; min-height: 100vh; margin: 0; }
+  .card { background: #1a2027; padding: 2.2rem 2.6rem; border-radius: 12px; width: min(22rem, calc(100vw - 4rem));
+          box-shadow: 0 8px 40px rgba(0,0,0,.45); }
+  h1 { font-size: 1.25rem; margin: 0 0 .3rem; }
+  p.sub { color: #8b97a3; font-size: .85rem; margin: 0 0 1.6rem; }
+  label { display: block; font-size: .8rem; color: #8b97a3; margin: .9rem 0 .25rem; }
+  input { width: 100%; box-sizing: border-box; padding: .55rem .7rem; border-radius: 8px;
+          border: 1px solid #2c3641; background: #101418; color: inherit; font-size: .95rem; }
+  button { margin-top: 1.5rem; width: 100%; padding: .6rem; border: 0; border-radius: 8px;
+           background: #3b82f6; color: #fff; font-size: .95rem; cursor: pointer; }
+  .err { color: #f87171; font-size: .85rem; min-height: 1.2em; margin-top: 1rem; }
+  .back { display: block; margin-top: 1rem; color: #aab4c0; text-align: center; font-size: .9rem; }
+</style>
+</head>
+<body>
+  <form class="card" id="tab-login-form">
+    <h1>切换当前标签页用户</h1>
+    <p class="sub">只切换这个标签页，不影响其他标签页。</p>
+    <label for="tab-login-u">用户名</label>
+    <input id="tab-login-u" name="username" autocomplete="username" autofocus required>
+    <label for="tab-login-p">密码</label>
+    <input id="tab-login-p" name="password" type="password" autocomplete="current-password" required>
+    <div class="err" id="tab-login-error" role="status"></div>
+    <button type="submit">登录并切换</button>
+    <a class="back" href="/">返回</a>
+  </form>
+<script>
+(function(){
+  var form=document.getElementById('tab-login-form'),error=document.getElementById('tab-login-error');
+  form.addEventListener('submit',function(e){
+    e.preventDefault();
+    var button=form.querySelector('button');button.disabled=true;error.textContent='';
+    fetch('/hub/tab-login',{method:'POST',credentials:'same-origin',cache:'no-store',headers:{'Content-Type':'application/x-www-form-urlencoded','Accept':'application/json'},body:new URLSearchParams(new FormData(form)).toString()})
+      .then(function(r){return r.json().then(function(data){if(!r.ok)throw new Error(data.error||'登录失败');return data;});})
+      .then(function(data){sessionStorage.setItem('${TAB_SESSION_STORAGE_KEY}',data.tabSession);form.querySelector('[type=password]').value='';var back='/';try{var saved=sessionStorage.getItem('dsh-hub-tab-return');if(saved&&saved.charAt(0)==='/'&&saved.slice(0,2)!=='//')back=saved;sessionStorage.removeItem('dsh-hub-tab-return');}catch(e){}location.replace(back);})
+      .catch(function(err){error.textContent=err.message||'登录失败';button.disabled=false;});
+  });
+})();
+</script>
 </body>
 </html>`;
 
@@ -821,6 +963,28 @@ async function handleLogin(req, res) {
     location: '/',
   });
   res.end();
+}
+
+async function handleTabLogin(req, res) {
+  const ip = clientIp(req);
+  if (rateLimited(ip)) {
+    sendJson(res, 429, { error: '尝试过多，请 1 分钟后再试' });
+    return;
+  }
+  const { username, password } = urlencoded(await readBody(req));
+  if (!username || !password) {
+    sendJson(res, 400, { error: '请输入用户名和密码' });
+    return;
+  }
+  const info = lookupUser(username);
+  const ok = info && await pamAuthenticate(username, password)
+    && !(CFG.allowUsers.length && !CFG.allowUsers.includes(username));
+  if (!ok) {
+    recordFailure(ip);
+    sendJson(res, 401, { error: '用户名或密码错误' });
+    return;
+  }
+  sendJson(res, 200, { user: username, tabSession: makeTabSession(username) });
 }
 
 function handleLogout(req, res) {
@@ -946,7 +1110,8 @@ function sanitizeForwardHeaders(headers, bePort) {
   const out = {};
   for (const [k, v] of Object.entries(headers)) {
     const key = k.toLowerCase();
-    if (['connection', 'transfer-encoding', 'upgrade', 'keep-alive', 'proxy-connection', 'te', 'content-length', 'host'].includes(key)) continue;
+    if (key === TAB_SESSION_HEADER
+        || ['connection', 'transfer-encoding', 'upgrade', 'keep-alive', 'proxy-connection', 'te', 'content-length', 'host'].includes(key)) continue;
     out[k] = v;
   }
   out.host = `127.0.0.1:${bePort}`;
@@ -1036,9 +1201,24 @@ function prewarmSessionList(user, be) {
 
 async function route(req, res) {
   const url = new URL(req.url, 'http://x');
+  url.searchParams.delete(TAB_SESSION_QUERY);
+  req.url = `${url.pathname}${url.search}`;
 
   if (url.pathname === '/hub/login' && req.method === 'GET') {
     sendHtml(res, 200, LOGIN_PAGE.replace('__MSG__', ''));
+    return;
+  }
+  if (url.pathname === '/hub/tab-login' && req.method === 'GET') {
+    sendHtml(res, 200, TAB_LOGIN_PAGE, { 'cache-control': 'no-store' });
+    return;
+  }
+  if (url.pathname === '/hub/tab-login' && req.method === 'POST') {
+    await handleTabLogin(req, res);
+    return;
+  }
+  if (url.pathname === '/hub/tab-login') {
+    res.writeHead(405, { allow: 'GET, POST' });
+    res.end('Method Not Allowed');
     return;
   }
   if (url.pathname === '/hub/login' && req.method === 'POST') {
@@ -1047,13 +1227,10 @@ async function route(req, res) {
   }
   if (url.pathname === '/hub/me' && req.method === 'GET') {
     const user = sessionUser(req);
-    res.writeHead(200, {
-      'content-type': 'application/json; charset=utf-8',
-      'cache-control': 'no-store, no-cache, must-revalidate, private',
-      'pragma': 'no-cache',
-      'expires': '0',
-    });
-    res.end(JSON.stringify({ user }));
+    const tabSession = user
+      ? (req.headers[TAB_SESSION_HEADER] || makeTabSession(user))
+      : null;
+    sendJson(res, 200, { user, tabSession });
     return;
   }
   if (url.pathname === '/hub/logout') {
@@ -1071,6 +1248,7 @@ async function route(req, res) {
     handleLogout(req, res);
     return;
   }
+  delete req.headers[TAB_SESSION_HEADER];
 
   // Session-list RPC cache: serve the last known snapshot forever (serve-stale),
   // refresh it in the background on a throttle (see block above).
@@ -1186,14 +1364,20 @@ const server = http.createServer((req, res) => {
   });
 });
 
-// WebSocket upgrade (dsh event streams) — routed by the same session cookie.
+// WebSocket upgrade (dsh event streams) — routed by the same cookie/tab session as HTTP.
 server.on('upgrade', (req, socket, head) => {
+  const url = new URL(req.url, 'http://x');
+  const tabTokens = url.searchParams.getAll(TAB_SESSION_QUERY);
+  if (tabTokens.length) req.headers[TAB_SESSION_HEADER] = tabTokens.length === 1 ? tabTokens[0] : 'invalid';
+  url.searchParams.delete(TAB_SESSION_QUERY);
+  req.url = `${url.pathname}${url.search}`;
   const user = sessionUser(req);
   if (!user) {
     socket.write('HTTP/1.1 403 Forbidden\r\n\r\n');
     socket.destroy();
     return;
   }
+  delete req.headers[TAB_SESSION_HEADER];
   const be = backends.get(user);
   if (!be || !be.child || be.child.exitCode !== null) {
     socket.write('HTTP/1.1 503 Service Unavailable\r\n\r\n');

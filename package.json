@@ -1,7 +1,7 @@
 {
   "name": "dsh-hub",
   "version": "0.1.0",
-  "description": "A JupyterHub-style multi-user front for DeepSeek Harness (dsh): PAM auth, per-user isolated dsh instances, cookie-routed HTTP/WebSocket proxy. Zero modifications to dsh.",
+  "description": "A JupyterHub-style multi-user front for DeepSeek Harness (dsh): PAM auth, per-user isolated dsh instances, cookie- and per-tab-session-routed HTTP/WebSocket proxy. Zero modifications to dsh.",
   "type": "module",
   "main": "src/index.mjs",
   "scripts": {

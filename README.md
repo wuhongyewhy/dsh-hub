@@ -12,6 +12,8 @@ This fork is based on [Mpaperlee/dsh-hub](https://github.com/Mpaperlee/dsh-hub) 
   Hub 捕获并校验 DSH 的短时启动 URL，用一次性令牌换取后端会话 Cookie，并在日志中隐藏令牌。
 - **Per-user proxy cookies / 按用户转发 Cookie:** The matching user's backend Cookie is forwarded with that user's HTTP and WebSocket requests.
   代理会在该用户的 HTTP 和 WebSocket 请求中转发对应后端 Cookie。
+- **Per-tab users / 标签页独立用户:** Each browser tab keeps its own signed Hub session in `sessionStorage`; switching accounts in one tab does not change the others. HTTP and WebSocket requests are routed using that tab's identity.
+  每个浏览器标签页在 `sessionStorage` 中单独保存 Hub 会话；在一个标签页切换账号不会影响其他标签页，HTTP 和 WebSocket 请求也会按各自标签页的身份路由。
 - **Session-list cache / 会话列表缓存:** Valid session-list responses are persisted; cached results are served quickly while background refresh keeps them current.
   有效的会话列表响应会持久缓存，先快速返回缓存结果，再由后台刷新。
 - **Backend lifecycle / 后端生命周期:** Concurrent startup requests share one readiness wait, and shutdown stops child backends and removes their firewall guards.
@@ -19,9 +21,9 @@ This fork is based on [Mpaperlee/dsh-hub](https://github.com/Mpaperlee/dsh-hub) 
 
 ### Draggable user badge / 可拖动用户徽标
 
-Set `HUB_USER_BADGE=1` to show a badge with the signed-in username and a “Switch user” link. The username comes from `/hub/me`; the link opens `/hub/logout`. Drag it with a mouse or touch, and its position is saved in the browser.
+Set `HUB_USER_BADGE=1` to show a badge with the signed-in username and a “Switch user” link. The username comes from `/hub/me`; the link opens a tab-local login page. Drag it with a mouse or touch, and its position is saved in the browser.
 
-设置 `HUB_USER_BADGE=1` 后，会显示当前用户名和“切换用户”入口。用户名由 `/hub/me` 按当前会话读取，入口跳转到 `/hub/logout`。徽标支持鼠标或触屏拖动，位置保存在浏览器中。
+设置 `HUB_USER_BADGE=1` 后，会显示当前用户名和“切换用户”入口。用户名由 `/hub/me` 按当前标签页会话读取，入口打开仅作用于当前标签页的登录页面。徽标支持鼠标或触屏拖动，位置保存在浏览器中。
 
 ### Optional Unsloth key / 可选 Unsloth 密钥
 
@@ -39,8 +41,8 @@ When `/var/lib/dsh-hub/unsloth-api-key` exists, its contents are passed to child
 
 A [JupyterHub](https://jupyterhub.readthedocs.io)-style multi-user front for
 [DeepSeek Harness (dsh)](https://github.com/deepseek-ai/deepseek-harness) —
-PAM login, one isolated dsh instance per system user, and a cookie-routed
-HTTP/WebSocket proxy. **Zero modifications to dsh**: upstream upgrades and
+PAM login, one isolated dsh instance per system user, and a cookie- or
+tab-session-routed HTTP/WebSocket proxy. **Zero modifications to dsh**: upstream upgrades and
 per-user plugin installs keep working.
 
 > **中文简介**:[dsh-hub](README.md) 是 [DeepSeek Harness (dsh)](https://github.com/deepseek-ai/deepseek-harness) 的多用户网关,思路完全对标
@@ -50,8 +52,8 @@ per-user plugin installs keep working.
 > 每用户自行安装插件均不受影响。
 
 ```
-browser ──http://<server-ip>:3080──▶ dsh-hub ──cookie──▶ 127.0.0.1:<port> ──▶ dsh (user A)
-                                        │                127.0.0.1:<port> ──▶ dsh (user B)
+browser ──http://<server-ip>:3080──▶ dsh-hub ──cookie / tab session──▶ 127.0.0.1:<port> ──▶ dsh (user A)
+                                             └──────────────────────▶ 127.0.0.1:<port> ──▶ dsh (user B)
                                         └─ spawn as uid/gid + iptables owner-guard
 ```
 
@@ -59,9 +61,9 @@ browser ──http://<server-ip>:3080──▶ dsh-hub ──cookie──▶ 127
 
 | JupyterHub | dsh-hub |
 |---|---|
-| Authenticator (PAM) | PAM via `authenticate-pam` (optional) with a `su`-based fallback; HMAC-signed session cookie |
+| Authenticator (PAM) | PAM via `authenticate-pam` (optional) with a `su`-based fallback; HMAC-signed login cookie and per-tab sessions |
 | Spawner | `dsh web --port <random>` spawned with the user's uid/gid and a per-user `DSH_HOME` |
-| Configurable HTTP proxy | `http-proxy` routes HTTP + WebSocket by session cookie |
+| Configurable HTTP proxy | `http-proxy` routes HTTP + WebSocket by the shared login cookie or signed per-tab session |
 | Idle culler (jupyterhub-idle-culler) | built-in culler, `IDLE_CULL_MS` (0 = never, tmux-style always-on) |
 | Single-user server trusts the hub | loopback proxying with SameSite-cookie CSRF protection (JupyterHub's trust split) |
 
@@ -71,8 +73,10 @@ dsh's web server enforces a browser trust fence (`Origin`/`Host` authority
 checks) against DNS-rebinding and CSRF. dsh-hub's proxy (default
 `TRUST_MODE=origin-rewrite`) presents itself as a loopback same-origin client:
 Host and Origin are rewritten to the backend's loopback authority, and
-cross-site protection is carried by the hub's `SameSite=Lax` session cookie —
-the same trust split JupyterHub uses between its proxy and single-user servers.
+cross-site protection is carried by the hub's `SameSite=Lax` login cookie.
+After login, a signed per-tab token can also route same-origin HTTP requests and
+WebSockets; the Hub removes the token before forwarding to dsh. The same trust
+split JupyterHub uses between its proxy and single-user servers is preserved.
 
 `TRUST_MODE=trusted-host` spawns instances with dsh's official
 `--trusted-host` flag and forwards Host/Origin untouched. Note: as of current
@@ -100,7 +104,8 @@ flight: `isLoopbackHostname(pageLocation.hostname)` becomes `true`. The patch
 is pattern-based against dsh's unminified bundle, cached per bundle rev, and
 fails loud in the hub log when an upstream upgrade renames the expression.
 Trust stays with the hub: only PAM-authenticated users reach the backend at
-all, and the SameSite=Lax session cookie still blocks cross-site requests.
+all; the SameSite=Lax login cookie and same-origin per-tab request credentials
+keep cross-site requests from selecting a user's backend.
 
 ### Authenticated dsh launch URLs
 
