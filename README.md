@@ -70,6 +70,25 @@ fails loud in the hub log when an upstream upgrade renames the expression.
 Trust stays with the hub: only PAM-authenticated users reach the backend at
 all, and the SameSite=Lax session cookie still blocks cross-site requests.
 
+### Authenticated dsh launch URLs
+
+Newer dsh versions print a one-time token in their `dsh web:` startup URL. The Hub
+captures and validates the loopback URL, exchanges the token for dsh's session
+cookie, and attaches that cookie only to the user's proxied HTTP and WebSocket
+requests. Token query strings are redacted from startup logs.
+
+### User switch badge
+
+Set `HUB_USER_BADGE=1` to inject the badge into proxied HTML. It gets the current
+username from `/hub/me` and links to `/hub/logout`. Drag with a mouse or touch;
+the position is saved in that browser. The badge is disabled by default.
+
+### Optional Unsloth key
+
+If `/var/lib/dsh-hub/unsloth-api-key` exists, the Hub passes it to spawned dsh
+processes as `DSH_UNSLOTH_API_KEY`. Keep the root-managed key file out of the
+repository and restrict its permissions.
+
 ## Isolation guarantees (run as root)
 
 - Each dsh instance runs as the user's own **uid/gid** with `DSH_HOME=~/.dsh`
@@ -105,6 +124,7 @@ username/password**, and get a private dsh instance.
 |---|---|---|
 | `DSH_BIN` | *(required)* | dsh CLI entry (built checkout: `apps/cli/lib/bin.js`) |
 | `HUB_HOST` / `HUB_PORT` | `0.0.0.0` / `3080` | hub listen address |
+| `HUB_USER_BADGE` | `0` | Set to `1` to add the draggable user switch badge to proxied HTML |
 | `TRUST_MODE` | `origin-rewrite` | `trusted-host` forwards Host/Origin untouched (see trust model above) |
 | `TRUSTED_HOSTS` | auto (LAN IPv4s) | extra authorities for `--trusted-host` (hostnames/DNS names) |
 | `IDLE_CULL_MS` | `14400000` (4h) | `0` disables culling — backends keep running with the browser closed |

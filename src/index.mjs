@@ -89,6 +89,7 @@ const CFG = {
   // Optional comma-separated allow-list of usernames. Empty = all system users.
   allowUsers: (process.env.ALLOW_USERS ?? '')
     .split(',').map((s) => s.trim()).filter(Boolean),
+  userBadge: process.env.HUB_USER_BADGE === '1',
   logDir: process.env.HUB_LOG_DIR ?? '/var/log/dsh-hub',
 };
 
@@ -230,6 +231,8 @@ class Backend {
     this.ready = null;      // promise resolved when TCP accepts
     this.lastActivity = Date.now();
     this.starting = false;
+    this.launchUrl = null;
+    this.authCookie = '';
   }
 }
 
@@ -257,6 +260,106 @@ function waitTcp(port, timeoutMs) {
       });
     })();
   });
+}
+
+function redactLaunchToken(text) {
+  return text.replace(/([?&]token=)[^&#\s]+/gu, '$1[REDACTED]');
+}
+
+// DSH >= 0.1.2 requires a per-process launch-token exchange before serving its UI.
+function captureDshLaunchUrl(child, expectedPort, log, timeoutMs) {
+  return new Promise((resolve, reject) => {
+    let pending = '';
+    let settled = false;
+    const finish = (err, url) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      if (err) reject(err);
+      else resolve(url);
+    };
+    const consumeLine = (line) => {
+      const match = /\bdsh web:\s+(https?:\/\/\S+)/u.exec(line);
+      if (match) {
+        try {
+          const url = new URL(match[1]);
+          const tokens = url.searchParams.getAll('token');
+          if (url.protocol === 'http:' && url.hostname === '127.0.0.1'
+              && Number(url.port) === expectedPort && tokens.length === 1 && tokens[0]) {
+            finish(null, url);
+          }
+        } catch { /* ignore unrelated startup output */ }
+      }
+      if (log !== 'ignore') log.write(`${redactLaunchToken(line)}\n`);
+    };
+    const timer = setTimeout(() => {
+      finish(new Error(`dsh did not publish its authenticated launch URL within ${timeoutMs}ms`));
+    }, timeoutMs);
+    child.stdout.setEncoding('utf8');
+    child.stdout.on('data', (chunk) => {
+      pending += chunk;
+      let newline;
+      while ((newline = pending.indexOf('\n')) !== -1) {
+        const line = pending.slice(0, newline).replace(/\r$/u, '');
+        pending = pending.slice(newline + 1);
+        consumeLine(line);
+      }
+    });
+    child.stdout.once('end', () => { if (pending) consumeLine(pending); });
+    child.once('error', (err) => finish(err));
+    child.once('exit', (code, signal) => {
+      if (!settled) finish(new Error(`dsh exited before publishing its launch URL (code=${code} signal=${signal})`));
+    });
+  });
+}
+
+function exchangeDshLaunchToken(launchUrl, timeoutMs) {
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const finish = (err, cookie) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      if (err) reject(err);
+      else resolve(cookie);
+    };
+    const req = http.request({
+      hostname: launchUrl.hostname,
+      port: Number(launchUrl.port),
+      method: 'GET',
+      path: `${launchUrl.pathname}${launchUrl.search}`,
+      headers: { host: launchUrl.host, connection: 'close' },
+    }, (res) => {
+      const setCookies = res.headers['set-cookie'];
+      const cookiePairs = (Array.isArray(setCookies) ? setCookies : setCookies ? [setCookies] : [])
+        .map((value) => value.split(';', 1)[0].trim())
+        .filter((value) => value.includes('='));
+      res.resume();
+      res.once('end', () => {
+        if (res.statusCode !== 303 || cookiePairs.length === 0) {
+          finish(new Error(`dsh launch-token exchange failed (HTTP ${res.statusCode})`));
+          return;
+        }
+        finish(null, cookiePairs.join('; '));
+      });
+    });
+    const timer = setTimeout(() => req.destroy(new Error('dsh launch-token exchange timed out')), timeoutMs);
+    req.once('error', (err) => finish(err));
+    req.end();
+  });
+}
+
+function backendCookieHeader(be, incomingCookie) {
+  const authPairs = String(be.authCookie ?? '').split(';').map((part) => part.trim()).filter((part) => part.includes('='));
+  const authNames = new Set(authPairs.map((part) => part.slice(0, part.indexOf('=')).trim()));
+  const callerPairs = String(incomingCookie ?? '').split(';').map((part) => part.trim()).filter((part) => {
+    const equals = part.indexOf('=');
+    if (equals < 1) return false;
+    const name = part.slice(0, equals).trim();
+    return name !== CFG.cookieName && !authNames.has(name);
+  });
+  const merged = [...callerPairs, ...authPairs].join('; ');
+  return merged || undefined;
 }
 
 // iptables loopback owner-guard: only the backend's own uid (and root) may
@@ -308,8 +411,11 @@ function logStreamFor(user) {
 
 async function getOrCreateBackend(user) {
   let be = backends.get(user);
+  if (be?.starting && be.ready) {
+    await be.ready;
+    return be;
+  }
   if (be && be.child && be.child.exitCode === null) return be;
-  if (be?.starting) return be;
 
   const info = lookupUser(user);
   if (!info) throw new Error(`unknown system user: ${user}`);
@@ -329,6 +435,10 @@ async function getOrCreateBackend(user) {
     PATH: '/usr/local/bin:/usr/bin:/bin',
     LANG: process.env.LANG ?? 'en_US.UTF-8',
     TERM: 'xterm-256color',
+    DSH_UNSLOTH_API_KEY: (() => {
+      try { return fs.readFileSync('/var/lib/dsh-hub/unsloth-api-key', 'utf8').trim(); }
+      catch { return ''; }
+    })(),
   };
 
   // Per-user default workspace: if ~/.dsh/hub-default-workspace names an
@@ -358,12 +468,9 @@ async function getOrCreateBackend(user) {
   const child = spawn(process.execPath, args, opts);
   be.child = child;
   const log = logStreamFor(user);
-  if (log !== 'ignore') {
-    child.stdout.pipe(log, { end: false });
-    child.stderr.pipe(log, { end: false });
-  } else {
-    child.stdout.resume(); child.stderr.resume();
-  }
+  const launchUrlReady = captureDshLaunchUrl(child, port, log, CFG.spawnTimeoutMs);
+  if (log !== 'ignore') child.stderr.pipe(log, { end: false });
+  else child.stderr.resume();
 
   addGuard(port, info.uid);
 
@@ -373,9 +480,19 @@ async function getOrCreateBackend(user) {
     if (backends.get(user) === be) backends.delete(user);
   });
 
-  be.ready = waitTcp(port, CFG.spawnTimeoutMs).finally(() => { be.starting = false; });
-  await be.ready;
-  prewarmSessionList(user, be); // warm the session-list cache before the browser asks
+  be.ready = launchUrlReady.then(async (launchUrl) => {
+    be.launchUrl = launchUrl;
+    await waitTcp(port, CFG.spawnTimeoutMs);
+    be.authCookie = await exchangeDshLaunchToken(launchUrl, CFG.spawnTimeoutMs);
+  }).finally(() => { be.starting = false; });
+  try {
+    await be.ready;
+  } catch (err) {
+    be.child?.kill('SIGTERM');
+    setTimeout(() => be.child?.kill('SIGKILL'), 5000).unref();
+    throw err;
+  }
+  prewarmSessionList(user, be); // warm the session-list cache after DSH browser auth
   return be;
 }
 
@@ -417,6 +534,101 @@ function uuid4(){
 try{Object.defineProperty(crypto,'randomUUID',{value:uuid4,writable:true,configurable:true});}
 catch(e){try{crypto.randomUUID=uuid4;}catch(e2){}}
 })();</script>`;
+
+const USER_BADGE_SNIPPET = CFG.userBadge ? `<style id="dsh-hub-user-badge-style">
+#dsh-hub-user-badge{position:fixed!important;left:12px;top:12px;right:auto!important;bottom:auto!important;z-index:2147483647!important;display:flex;flex-direction:column;align-items:stretch;gap:0;padding:4px;border:1px solid rgba(15,23,42,.12);border-radius:12px;background:rgba(255,255,255,.96);box-shadow:0 3px 12px rgba(15,23,42,.1);backdrop-filter:blur(10px);cursor:grab;touch-action:none;user-select:none;-webkit-user-select:none}
+#dsh-hub-user-badge.dsh-hub-dragging{cursor:grabbing}
+#dsh-hub-user-badge a,#dsh-hub-user-badge span{box-sizing:border-box;display:block;max-width:200px;color:#1f2937!important;font:600 12px/1.25 system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;cursor:inherit}
+#dsh-hub-user-badge a{padding:5px 9px;border-radius:8px;text-decoration:none!important;white-space:pre-line;text-align:center;line-height:1.15;transition:background .15s ease}
+#dsh-hub-user-badge a:hover{background:#f1f5f9}
+#dsh-hub-user-badge span{padding:5px 9px;border-top:1px solid rgba(15,23,42,.1);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+#dsh-hub-user-badge span[hidden]{display:none}
+@media(prefers-color-scheme:dark){
+#dsh-hub-user-badge{background:rgba(24,27,33,.96);border-color:rgba(255,255,255,.14);box-shadow:0 3px 12px rgba(0,0,0,.3)}
+#dsh-hub-user-badge a,#dsh-hub-user-badge span{color:#f3f4f6!important}
+#dsh-hub-user-badge a:hover{background:rgba(255,255,255,.09)}
+#dsh-hub-user-badge span{border-top-color:rgba(255,255,255,.14)}
+}</style><script>(function(){
+var id='dsh-hub-user-badge';
+var positionKey='dsh-hub-user-badge-position-v1';
+function mount(){
+  if(!document.body)return false;
+  var badge=document.getElementById(id);
+  if(badge){if(badge.parentNode!==document.body)document.body.appendChild(badge);return true;}
+  badge=document.createElement('div');badge.id=id;
+  badge.title='按住徽章拖动可移动位置';
+  var link=document.createElement('a');link.href='/hub/logout';link.textContent='切换\\n用户';
+  var label=document.createElement('span');label.hidden=true;label.setAttribute('aria-label','当前用户名');
+  badge.appendChild(link);badge.appendChild(label);document.body.appendChild(badge);
+
+  function place(x,y){
+    var maxX=Math.max(4,window.innerWidth-badge.offsetWidth-4);
+    var maxY=Math.max(4,window.innerHeight-badge.offsetHeight-4);
+    badge.style.left=Math.max(4,Math.min(maxX,x))+'px';
+    badge.style.top=Math.max(4,Math.min(maxY,y))+'px';
+  }
+  function savePosition(){
+    try{var r=badge.getBoundingClientRect();localStorage.setItem(positionKey,JSON.stringify({x:r.left,y:r.top}));}catch(e){}
+  }
+  function keepVisible(){
+    var r=badge.getBoundingClientRect();place(r.left,r.top);savePosition();
+  }
+  try{
+    var saved=JSON.parse(localStorage.getItem(positionKey)||'null');
+    if(saved&&Number.isFinite(saved.x)&&Number.isFinite(saved.y))place(saved.x,saved.y);
+  }catch(e){}
+
+  var active=null;
+  var suppressClickUntil=0;
+  function move(e){
+    if(!active||e.pointerId!==active.pointerId)return;
+    var dx=e.clientX-active.x,dy=e.clientY-active.y;
+    if(!active.moved&&Math.hypot(dx,dy)<4)return;
+    if(!active.moved){
+      active.moved=true;
+      if(badge.setPointerCapture)try{badge.setPointerCapture(e.pointerId);}catch(err){}
+    }
+    place(active.left+dx,active.top+dy);
+    if(e.cancelable)e.preventDefault();
+  }
+  function finish(e){
+    if(!active||e.pointerId!==active.pointerId)return;
+    var moved=active.moved;
+    active=null;
+    badge.classList.remove('dsh-hub-dragging');
+    window.removeEventListener('pointermove',move);
+    window.removeEventListener('pointerup',finish);
+    window.removeEventListener('pointercancel',finish);
+    if(moved){savePosition();suppressClickUntil=Date.now()+800;}
+  }
+  badge.addEventListener('pointerdown',function(e){
+    suppressClickUntil=0;
+    if(active||e.isPrimary===false||(e.pointerType==='mouse'&&e.button!==0))return;
+    var r=badge.getBoundingClientRect();
+    active={pointerId:e.pointerId,x:e.clientX,y:e.clientY,left:r.left,top:r.top,moved:false};
+    badge.classList.add('dsh-hub-dragging');
+    window.addEventListener('pointermove',move,{passive:false});
+    window.addEventListener('pointerup',finish);
+    window.addEventListener('pointercancel',finish);
+  });
+  document.addEventListener('click',function(e){
+    if(Date.now()>suppressClickUntil)return;
+    suppressClickUntil=0;
+    e.preventDefault();e.stopImmediatePropagation();
+  },true);
+  window.addEventListener('resize',keepVisible);
+
+  fetch('/hub/me',{credentials:'same-origin',cache:'no-store',headers:{Accept:'application/json'}})
+    .then(function(r){if(!r.ok)throw new Error('session lookup failed');return r.json();})
+    .then(function(data){if(data&&typeof data.user==='string'&&data.user){label.textContent=data.user;label.hidden=false;keepVisible();}})
+    .catch(function(){});
+  return true;
+}
+if(mount())return;
+if(!document.documentElement){document.addEventListener('DOMContentLoaded',mount,{once:true});return;}
+var observer=new MutationObserver(function(){if(mount())observer.disconnect();});
+observer.observe(document.documentElement,{childList:true,subtree:true});
+})();</script>` : '';
 
 // dsh's settings/credentials plane is browser-gated: connection.isLoopback is
 // computed from location.hostname (packages/client/connection), so a page
@@ -494,11 +706,14 @@ proxy.on('proxyRes', (proxyRes, req, res) => {
     const headers = { ...proxyRes.headers };
     delete headers['content-length'];
     delete headers['content-encoding'];
+    delete headers['etag'];
+    delete headers['last-modified'];
+    headers['cache-control'] = 'no-store';
     res.writeHead(proxyRes.statusCode, headers);
     const html = Buffer.concat(chunks).toString('utf-8');
     const injected = /<head[^>]*>/i.test(html)
-      ? html.replace(/<head[^>]*>/i, (m) => m + RANDOM_UUID_POLYFILL)
-      : RANDOM_UUID_POLYFILL + html;
+      ? html.replace(/<head[^>]*>/i, (m) => m + RANDOM_UUID_POLYFILL + USER_BADGE_SNIPPET)
+      : RANDOM_UUID_POLYFILL + USER_BADGE_SNIPPET + html;
     res.end(Buffer.from(injected, 'utf-8'));
   });
 });
@@ -740,12 +955,16 @@ function sanitizeForwardHeaders(headers, bePort) {
 
 function forwardSessionList(be, headers, body) {
   return new Promise((resolve, reject) => {
+    const requestHeaders = sanitizeForwardHeaders(headers, be.port);
+    const cookie = backendCookieHeader(be, headers.cookie);
+    if (cookie) requestHeaders.cookie = cookie;
+    else delete requestHeaders.cookie;
     const req = http.request({
       host: '127.0.0.1',
       port: be.port,
       method: 'POST',
       path: SESSION_LIST_PATH,
-      headers: { ...sanitizeForwardHeaders(headers, be.port), 'content-length': body.length, connection: 'close' },
+      headers: { ...requestHeaders, 'content-length': body.length, connection: 'close' },
     }, (res) => {
       const chunks = [];
       res.on('data', (c) => chunks.push(c));
@@ -826,6 +1045,17 @@ async function route(req, res) {
     await handleLogin(req, res);
     return;
   }
+  if (url.pathname === '/hub/me' && req.method === 'GET') {
+    const user = sessionUser(req);
+    res.writeHead(200, {
+      'content-type': 'application/json; charset=utf-8',
+      'cache-control': 'no-store, no-cache, must-revalidate, private',
+      'pragma': 'no-cache',
+      'expires': '0',
+    });
+    res.end(JSON.stringify({ user }));
+    return;
+  }
   if (url.pathname === '/hub/logout') {
     handleLogout(req, res);
     return;
@@ -883,6 +1113,7 @@ async function route(req, res) {
       // Backend died between spawn and forward (cull/restart race): fall back
       // to the streaming proxy, which re-triggers the spawn-on-demand path.
       console.error(`[hub] session.list forward failed for ${user}:`, err.message);
+      req.headers.cookie = backendCookieHeader(be, req.headers.cookie);
       proxy.web(req, res, { target: `http://127.0.0.1:${be.port}` });
       return;
     }
@@ -934,8 +1165,14 @@ async function route(req, res) {
     // request already passed the hub's PAM cookie authentication.
     req.headers.origin = `http://127.0.0.1:${be.port}`;
   }
+  // Hub auth is handled above; add this user's DSH browser cookie before proxying.
+  req.headers.cookie = backendCookieHeader(be, req.headers.cookie);
   // Force identity encoding so the HTML rewrite below sees plain text.
   req.headers['accept-encoding'] = 'identity';
+  if (String(req.headers.accept ?? '').includes('text/html')) {
+    delete req.headers['if-none-match'];
+    delete req.headers['if-modified-since'];
+  }
   proxy.web(req, res, { target: `http://127.0.0.1:${be.port}` });
 }
 
@@ -967,6 +1204,9 @@ server.on('upgrade', (req, socket, head) => {
   if (TRUST_MODE === 'origin-rewrite') {
     req.headers.origin = `http://127.0.0.1:${be.port}`;
   }
+  const backendCookie = backendCookieHeader(be, req.headers.cookie);
+  if (backendCookie) req.headers.cookie = backendCookie;
+  else delete req.headers.cookie;
   proxy.ws(req, socket, head, { target: `http://127.0.0.1:${be.port}` });
 });
 
@@ -985,3 +1225,33 @@ server.listen(CFG.hubPort, CFG.hubHost, () => {
     ? '[hub] idle culling DISABLED — backends run until stopped'
     : `[hub] idle cull after ${Math.round(CFG.idleCullMs / 60000)} min`);
 });
+
+// Clean up per-user backends and loopback firewall guards on service stop.
+let shutdownRequested = false;
+async function shutdownHub(signal) {
+  if (shutdownRequested) return;
+  shutdownRequested = true;
+  console.log(`[hub] received ${signal}; stopping user backends`);
+  server.close();
+  const waits = [];
+  for (const be of [...backends.values()]) {
+    const child = be.child;
+    if (!child || child.exitCode !== null) {
+      removeGuard(be.port, be.info.uid);
+      continue;
+    }
+    waits.push(new Promise((resolve) => {
+      const forceKill = setTimeout(() => child.kill('SIGKILL'), 5000);
+      child.once('exit', () => {
+        clearTimeout(forceKill);
+        removeGuard(be.port, be.info.uid);
+        resolve();
+      });
+      child.kill('SIGTERM');
+    }));
+  }
+  await Promise.all(waits);
+  process.exit(0);
+}
+process.once('SIGTERM', () => { void shutdownHub('SIGTERM'); });
+process.once('SIGINT', () => { void shutdownHub('SIGINT'); });
