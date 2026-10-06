@@ -25,11 +25,11 @@ Set `HUB_USER_BADGE=1` to show a badge with the signed-in username and a “Swit
 
 设置 `HUB_USER_BADGE=1` 后，会显示当前用户名和“切换用户”入口。用户名由 `/hub/me` 按当前标签页会话读取，入口打开仅作用于当前标签页的登录页面。徽标支持鼠标或触屏拖动，位置保存在浏览器中。
 
-### Optional Unsloth key / 可选 Unsloth 密钥
+### Optional Hub API key / 可选 Hub API 密钥
 
-When `/var/lib/dsh-hub/dsh-hub-api-key-api-key` exists, its contents are passed to child DSH processes as `DSH_UNSLOTH_API_KEY`. The key file is not part of this repository and should remain root-only.
+When `/var/lib/dsh-hub/dsh-hub-api-key-api-key` exists, its contents are passed to child DSH processes as `DSH_HUB_API_KEY`. The key file is not part of this repository and should remain root-only.
 
-如果 `/var/lib/dsh-hub/dsh-hub-api-key-api-key` 存在，Hub 会将其内容作为 `DSH_UNSLOTH_API_KEY` 传给子 DSH 进程。密钥文件不属于本仓库，应仅允许 root 访问。
+如果 `/var/lib/dsh-hub/dsh-hub-api-key-api-key` 存在，Hub 会将其内容作为 `DSH_HUB_API_KEY` 传给子 DSH 进程。密钥文件不属于本仓库，应仅允许 root 访问。
 
 ---
 
@@ -120,10 +120,10 @@ Set `HUB_USER_BADGE=1` to inject the badge into proxied HTML. It gets the curren
 username from `/hub/me` and links to `/hub/logout`. Drag with a mouse or touch;
 the position is saved in that browser. The badge is disabled by default.
 
-### Optional Unsloth key
+### Optional Hub API key
 
 If `/var/lib/dsh-hub/dsh-hub-api-key-api-key` exists, the Hub passes it to spawned dsh
-processes as `DSH_UNSLOTH_API_KEY`. Keep the root-managed key file out of the
+processes as `DSH_HUB_API_KEY`. Keep the root-managed key file out of the
 repository and restrict its permissions.
 
 ## Isolation guarantees (run as root)

@@ -462,7 +462,7 @@ async function getOrCreateBackend(user) {
     PATH: '/usr/local/bin:/usr/bin:/bin',
     LANG: process.env.LANG ?? 'en_US.UTF-8',
     TERM: 'xterm-256color',
-    DSH_UNSLOTH_API_KEY: (() => {
+    DSH_HUB_API_KEY: (() => {
       try { return fs.readFileSync('/var/lib/dsh-hub/dsh-hub-api-key-api-key', 'utf8').trim(); }
       catch { return ''; }
     })(),
