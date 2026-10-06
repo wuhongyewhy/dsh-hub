@@ -3,7 +3,7 @@ import vm from 'node:vm';
 import http from 'node:http';
 import crypto from 'node:crypto';
 
-const source = fs.readFileSync(new URL('../../src/index.mjs', import.meta.url), 'utf8');
+const source = fs.readFileSync(new URL('../../src/index.mjs', import.meta.url), 'utf8').replace(/\r\n/g, '\n');
 const context = vm.createContext({
   crypto, Buffer, URL, URLSearchParams,
   SECRET: crypto.randomBytes(32),
@@ -38,6 +38,7 @@ for (const name of ['sign', 'makeCookie', 'parseCookie', 'sessionUser', 'makeTab
 // Use the production routing code through the login/me/logout endpoints.
 const routeStart = source.indexOf('async function route(req, res) {');
 const routeEnd = source.indexOf('\n  const user = sessionUser(req);\n  if (!user)', routeStart);
+if (routeStart < 0 || routeEnd < 0) throw new Error('Missing production login routing boundary');
 vm.runInContext(source.slice(routeStart, routeEnd) + '\n}', context);
 const upgradeStart = source.indexOf("server.on('upgrade', (req, socket, head) => {");
 const upgradeBody = source.indexOf('\n', upgradeStart);
