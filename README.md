@@ -27,9 +27,9 @@ Set `HUB_USER_BADGE=1` to show a badge with the signed-in username and a “Swit
 
 ### Optional Unsloth key / 可选 Unsloth 密钥
 
-When `/var/lib/dsh-hub/unsloth-api-key` exists, its contents are passed to child DSH processes as `DSH_UNSLOTH_API_KEY`. The key file is not part of this repository and should remain root-only.
+When `/var/lib/dsh-hub/dsh-hub-api-key-api-key` exists, its contents are passed to child DSH processes as `DSH_UNSLOTH_API_KEY`. The key file is not part of this repository and should remain root-only.
 
-如果 `/var/lib/dsh-hub/unsloth-api-key` 存在，Hub 会将其内容作为 `DSH_UNSLOTH_API_KEY` 传给子 DSH 进程。密钥文件不属于本仓库，应仅允许 root 访问。
+如果 `/var/lib/dsh-hub/dsh-hub-api-key-api-key` 存在，Hub 会将其内容作为 `DSH_UNSLOTH_API_KEY` 传给子 DSH 进程。密钥文件不属于本仓库，应仅允许 root 访问。
 
 ---
 
@@ -122,7 +122,7 @@ the position is saved in that browser. The badge is disabled by default.
 
 ### Optional Unsloth key
 
-If `/var/lib/dsh-hub/unsloth-api-key` exists, the Hub passes it to spawned dsh
+If `/var/lib/dsh-hub/dsh-hub-api-key-api-key` exists, the Hub passes it to spawned dsh
 processes as `DSH_UNSLOTH_API_KEY`. Keep the root-managed key file out of the
 repository and restrict its permissions.
 
