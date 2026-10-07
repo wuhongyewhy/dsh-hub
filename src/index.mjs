@@ -155,12 +155,36 @@ function sessionUser(req) {
   return user;
 }
 
+// Preserve upstream query bytes: DSH combo bundles use /plugins/??a.js,b.js&rev=...
+// URLSearchParams.delete() would also re-encode that unrelated combo syntax.
+function stripTabSession(value) {
+  const hashAt = value.indexOf('#');
+  const hash = hashAt < 0 ? '' : value.slice(hashAt);
+  const raw = hashAt < 0 ? value : value.slice(0, hashAt);
+  const queryAt = raw.indexOf('?');
+  if (queryAt < 0) return value;
+  const parts = raw.slice(queryAt + 1).split('&');
+  const kept = parts.filter((part) => {
+    try { return decodeURIComponent(part.split('=')[0].replace(/\+/g, ' ')) !== TAB_SESSION_QUERY; }
+    catch { return true; }
+  });
+  if (kept.length === parts.length) return value;
+  return raw.slice(0, queryAt) + (kept.length ? '?' + kept.join('&') : '') + hash;
+}
+
+function addTabSession(value, token) {
+  const clean = stripTabSession(value);
+  const hashAt = clean.indexOf('#');
+  const raw = hashAt < 0 ? clean : clean.slice(0, hashAt);
+  const hash = hashAt < 0 ? '' : clean.slice(hashAt);
+  return raw + (raw.includes('?') ? '&' : '?') + TAB_SESSION_QUERY + '=' + encodeURIComponent(token) + hash;
+}
+
 function stripTabSessionFromReferer(req) {
   try {
     const referer = new URL(req.headers.referer);
     if (referer.searchParams.has(TAB_SESSION_QUERY)) {
-      referer.searchParams.delete(TAB_SESSION_QUERY);
-      req.headers.referer = referer.toString();
+      req.headers.referer = stripTabSession(req.headers.referer);
     }
   } catch { /* absent or non-URL Referer */ }
 }
@@ -583,12 +607,20 @@ function readToken(){try{return sessionStorage.getItem(storageKey)||'';}catch(e)
 function writeToken(value){try{if(value)sessionStorage.setItem(storageKey,value);else sessionStorage.removeItem(storageKey);}catch(e){}}
 function sameOrigin(value){try{return new URL(value instanceof Request?value.url:value,location.href).origin===location.origin;}catch(e){return false;}}
 try{var urlToken=new URL(location.href).searchParams.get(queryName);if(urlToken)writeToken(urlToken);}catch(e){}
+function tokenUrl(value,token){
+  var hashAt=value.indexOf('#'),hash=hashAt<0?'':value.slice(hashAt),raw=hashAt<0?value:value.slice(0,hashAt);
+  var queryAt=raw.indexOf('?');
+  if(queryAt>=0){
+    var parts=raw.slice(queryAt+1).split('&'),kept=parts.filter(function(part){try{return decodeURIComponent(part.split('=')[0].replace(/\+/g,' '))!==queryName;}catch(e){return true;}});
+    if(kept.length!==parts.length)raw=raw.slice(0,queryAt)+(kept.length?'?'+kept.join('&'):'');
+  }
+  return raw+(raw.indexOf('?')>=0?'&':'?')+queryName+'='+encodeURIComponent(token)+hash;
+}
 function withTabUrl(value){
   try{
     var parsed=new URL(value,location.href);
     if(parsed.origin!==location.origin||/^\/hub\/(?:login|tab-login|logout)(?:\/|$)/.test(parsed.pathname))return value;
-    var token=readToken();if(token)parsed.searchParams.set(queryName,token);
-    return parsed.pathname+parsed.search+parsed.hash;
+    var token=readToken();return token?tokenUrl(parsed.href,token):value;
   }catch(e){return value;}
 }
 function keepTokenInAddress(){
@@ -596,12 +628,24 @@ function keepTokenInAddress(){
   try{
     var parsed=new URL(location.href);
     if(parsed.searchParams.get(queryName)===token)return;
-    parsed.searchParams.set(queryName,token);
-    history.replaceState(history.state,'',parsed.pathname+parsed.search+parsed.hash);
+    history.replaceState(history.state,'',tokenUrl(parsed.href,token));
   }catch(e){}
 }
 if(!window.__dshHubTabSessionWrapped){
   window.__dshHubTabSessionWrapped=true;
+  // DSH loads subsequent plugin batches through native script elements, not fetch.
+  // Parser-created tags are handled by the server; these hooks cover dynamic ones.
+  [[HTMLScriptElement,'src'],[HTMLLinkElement,'href']].forEach(function(entry){
+    var descriptor=Object.getOwnPropertyDescriptor(entry[0].prototype,entry[1]);
+    if(!descriptor||!descriptor.set||!descriptor.configurable)return;
+    Object.defineProperty(entry[0].prototype,entry[1],Object.assign({},descriptor,{set:function(value){return descriptor.set.call(this,withTabUrl(value));}}));
+  });
+  var nativeSetAttribute=Element.prototype.setAttribute;
+  Element.prototype.setAttribute=function(name,value){
+    var lower=String(name).toLowerCase();
+    if((this.tagName==='SCRIPT'&&lower==='src')||(this.tagName==='LINK'&&lower==='href'))value=withTabUrl(value);
+    return nativeSetAttribute.call(this,name,value);
+  };
   var nativePushState=history.pushState,nativeReplaceState=history.replaceState;
   history.pushState=function(){var args=Array.prototype.slice.call(arguments);if(args.length>2&&args[2]!=null)args[2]=withTabUrl(args[2]);return nativePushState.apply(this,args);};
   history.replaceState=function(){var args=Array.prototype.slice.call(arguments);if(args.length>2&&args[2]!=null)args[2]=withTabUrl(args[2]);return nativeReplaceState.apply(this,args);};
@@ -640,7 +684,7 @@ if(!window.__dshHubTabSessionWrapped){
         if(parsed.host===location.host&&(parsed.protocol==='ws:'||parsed.protocol==='wss:'||parsed.protocol==='http:'||parsed.protocol==='https:')){
           if(parsed.protocol==='http:')parsed.protocol='ws:';
           if(parsed.protocol==='https:')parsed.protocol='wss:';
-          parsed.searchParams.set(queryName,token);target=parsed.href;
+          target=tokenUrl(parsed.href,token);
         }
       }catch(e){}
       return protocols===undefined?new NativeWebSocket(target):new NativeWebSocket(target,protocols);
@@ -782,6 +826,24 @@ const CONNECTION_LOOPBACK_PATCH = /isLoopback:[^,\n]*isLoopbackHostname\([^)]*\)
 const patchedJsCache = new Map(); // url+etag -> patched body
 let loopbackPatchMissing = false;
 
+function routeHtmlResources(html, token) {
+  if (!token) return html;
+  // Consume entire script blocks so tag-shaped strings inside JS stay untouched.
+  return html.replace(/<script\b[^>]*>[\s\S]*?<\/script\s*>|<link\b[^>]*>/gi, (element) => {
+    const end = element.indexOf('>') + 1;
+    const tag = element.slice(0, end).replace(/(\s)(src|href)(\s*=\s*)(["'])(.*?)\4/gi,
+      (match, space, name, equals, quote, raw) => {
+        if ((/^<script/i.test(element) && name.toLowerCase() !== 'src') ||
+            (/^<link/i.test(element) && name.toLowerCase() !== 'href')) return match;
+        const value = raw.replace(/&amp;|&#38;|&#x26;/gi, '&');
+        if (!value || /^(?:[a-z][a-z\d+.-]*:|\/\/|#)/i.test(value)) return match;
+        const routed = addTabSession(value, token).replace(/&/g, '&amp;');
+        return space + name + equals + quote + routed + quote;
+      });
+    return tag + element.slice(end);
+  });
+}
+
 const proxy = httpProxy.createProxyServer({
   ws: true,
   // trusted-host mode keeps the browser's real Host so dsh's own fence (fed by
@@ -796,15 +858,16 @@ proxy.on('proxyRes', (proxyRes, req, res) => {
   const ct = String(proxyRes.headers['content-type'] ?? '');
   const url = String(req.url ?? '');
   // Plugin bundles: patch the connection client's isLoopback gate in flight.
-  const isPluginJs = /^\/plugins\/.+\.js(\?|$)/.test(url);
+  const isPluginJs = url.startsWith('/plugins/') && proxyRes.statusCode === 200 &&
+    /(?:javascript|ecmascript)/i.test(ct);
   if (isPluginJs) {
     const chunks = [];
     proxyRes.on('data', (c) => chunks.push(c));
     proxyRes.on('error', () => res.destroy());
     proxyRes.on('end', () => {
       const headers = { ...proxyRes.headers };
-      const cacheKey = `${url}|${String(headers.etag ?? '')}`;
-      const cached = patchedJsCache.get(cacheKey);
+      const cacheKey = `${req.hubUser}|${url}|${String(headers.etag ?? '')}`;
+      const cached = headers.etag ? patchedJsCache.get(cacheKey) : undefined;
       let body = cached;
       if (body === undefined) {
         let js = Buffer.concat(chunks).toString('utf-8');
@@ -817,7 +880,7 @@ proxy.on('proxyRes', (proxyRes, req, res) => {
         }
         body = Buffer.from(js, 'utf-8');
         if (patchedJsCache.size > 64) patchedJsCache.clear();
-        patchedJsCache.set(cacheKey, body);
+        if (headers.etag) patchedJsCache.set(cacheKey, body);
       }
       delete headers['content-length'];
       delete headers['content-encoding'];
@@ -843,7 +906,7 @@ proxy.on('proxyRes', (proxyRes, req, res) => {
     headers['cache-control'] = 'no-store';
     headers['referrer-policy'] = 'no-referrer';
     res.writeHead(proxyRes.statusCode, headers);
-    const html = Buffer.concat(chunks).toString('utf-8');
+    const html = routeHtmlResources(Buffer.concat(chunks).toString('utf-8'), req.hubTabSession);
     const injected = /<head[^>]*>/i.test(html)
       ? html.replace(/<head[^>]*>/i, (m) => m + RANDOM_UUID_POLYFILL + TAB_SESSION_SNIPPET + USER_BADGE_SNIPPET)
       : RANDOM_UUID_POLYFILL + TAB_SESSION_SNIPPET + USER_BADGE_SNIPPET + html;
@@ -1210,8 +1273,7 @@ async function route(req, res) {
   if (tabTokens.length && !req.headers[TAB_SESSION_HEADER]) {
     req.headers[TAB_SESSION_HEADER] = tabTokens.length === 1 ? tabTokens[0] : 'invalid';
   }
-  url.searchParams.delete(TAB_SESSION_QUERY);
-  req.url = `${url.pathname}${url.search}`;
+  req.url = stripTabSession(req.url);
 
   if (url.pathname === '/hub/login' || url.pathname === '/hub/tab-login') {
     if (req.method === 'GET') {
@@ -1248,6 +1310,8 @@ async function route(req, res) {
     return;
   }
   stripTabSessionFromReferer(req);
+  req.hubUser = user;
+  req.hubTabSession = req.headers[TAB_SESSION_HEADER] || makeTabSession(user);
   delete req.headers[TAB_SESSION_HEADER];
 
   // Session-list RPC cache: serve the last known snapshot forever (serve-stale),
@@ -1320,7 +1384,8 @@ async function route(req, res) {
   // Fast path: spawn already in progress — show the "starting" page instead
   // of blocking the request for the full spawn duration.
   const existing = backends.get(user);
-  if (existing?.starting) {
+  if (existing?.starting && req.method === 'GET' && String(req.headers.accept ?? '').includes('text/html') &&
+      !/^\/(?:plugins|assets)\//.test(url.pathname)) {
     sendHtml(res, 200, STARTING_PAGE);
     return;
   }
@@ -1371,8 +1436,7 @@ server.on('upgrade', (req, socket, head) => {
   if (tabTokens.length && !req.headers[TAB_SESSION_HEADER]) {
     req.headers[TAB_SESSION_HEADER] = tabTokens.length === 1 ? tabTokens[0] : 'invalid';
   }
-  url.searchParams.delete(TAB_SESSION_QUERY);
-  req.url = `${url.pathname}${url.search}`;
+  req.url = stripTabSession(req.url);
   const user = sessionUser(req);
   if (!user) {
     socket.write('HTTP/1.1 403 Forbidden\r\n\r\n');
