@@ -29,7 +29,7 @@ for (const name of ['RANDOM_UUID_POLYFILL', 'TAB_SESSION_SNIPPET', 'USER_BADGE_S
   context[name] = emittedHtml(name);
 }
 for (const name of ['sign', 'makeCookie', 'parseCookie', 'sessionUser', 'makeTabSession',
-  'parseTabSession', 'stripTabSessionFromReferer', 'clientIp', 'readBody', 'urlencoded',
+  'parseTabSession', 'stripTabSession', 'stripTabSessionFromReferer', 'clientIp', 'readBody', 'urlencoded',
   'sendHtml', 'sendJson', 'handleTabLogin', 'handleLogout']) {
   const definition = source.match(new RegExp('(?:async )?function ' + name + '\\([\\s\\S]*?\\n}'))?.[0];
   if (!definition) throw new Error(`Missing function ${name}`);

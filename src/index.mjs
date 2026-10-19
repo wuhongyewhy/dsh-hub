@@ -623,6 +623,16 @@ function withTabUrl(value){
     var token=readToken();return token?tokenUrl(parsed.href,token):value;
   }catch(e){return value;}
 }
+function mediaTabUrl(value){
+  try{
+    var parsed=new URL(String(value),location.href);
+    if(parsed.protocol!=='http:'&&parsed.protocol!=='https:')return value;
+    if(parsed.origin!==location.origin||/^\/hub\/(?:login|tab-login|logout)(?:\/|$)/.test(parsed.pathname))return value;
+    var token=readToken();if(!token)return value;
+    if(parsed.searchParams.get(queryName)===token)return value;
+    return tokenUrl(parsed.href,token);
+  }catch(e){return value;}
+}
 function keepTokenInAddress(){
   var token=readToken();if(!token)return;
   try{
@@ -640,12 +650,50 @@ if(!window.__dshHubTabSessionWrapped){
     if(!descriptor||!descriptor.set||!descriptor.configurable)return;
     Object.defineProperty(entry[0].prototype,entry[1],Object.assign({},descriptor,{set:function(value){return descriptor.set.call(this,withTabUrl(value));}}));
   });
+  var MEDIA_TAGS={IMG:1,VIDEO:1,AUDIO:1,SOURCE:1};
   var nativeSetAttribute=Element.prototype.setAttribute;
   Element.prototype.setAttribute=function(name,value){
     var lower=String(name).toLowerCase();
     if((this.tagName==='SCRIPT'&&lower==='src')||(this.tagName==='LINK'&&lower==='href'))value=withTabUrl(value);
+    else if(MEDIA_TAGS[this.tagName]&&lower==='src')value=mediaTabUrl(value);
     return nativeSetAttribute.call(this,name,value);
   };
+  // Media subresources (img/video/audio/source) load as no-cors requests that cannot carry
+  // the session header, so the tab token rides in the URL instead — same-origin http(s) only;
+  // blob:/data: URLs stay untouched. Dynamic property writes and setAttribute calls are
+  // hooked here; parser-created and innerHTML-created media are caught by the observer below.
+  [[HTMLImageElement,'src'],[HTMLVideoElement,'src'],[HTMLAudioElement,'src'],[HTMLSourceElement,'src']].forEach(function(entry){
+    if(!entry[0])return;
+    var descriptor=Object.getOwnPropertyDescriptor(entry[0].prototype,entry[1]);
+    if(!descriptor||!descriptor.set||!descriptor.configurable)return;
+    Object.defineProperty(entry[0].prototype,entry[1],Object.assign({},descriptor,{set:function(value){return descriptor.set.call(this,mediaTabUrl(value));}}));
+  });
+  function tagMedia(el){
+    try{
+      if(!MEDIA_TAGS[el.tagName])return;
+      var src=el.getAttribute('src');
+      if(src===null)return;
+      var next=mediaTabUrl(src);
+      if(next!==src)nativeSetAttribute.call(el,'src',next);
+    }catch(e){}
+  }
+  try{
+    var mediaObserver=new MutationObserver(function(records){
+      for(var i=0;i<records.length;i++){
+        var record=records[i];
+        if(record.type==='attributes'){tagMedia(record.target);continue;}
+        var added=record.addedNodes;
+        for(var j=0;j<added.length;j++){
+          var node=added[j];
+          if(node.nodeType!==1)continue;
+          tagMedia(node);
+          var inner=node.querySelectorAll?node.querySelectorAll('img,video,audio,source'):[];
+          for(var k=0;k<inner.length;k++)tagMedia(inner[k]);
+        }
+      }
+    });
+    mediaObserver.observe(document.documentElement,{childList:true,subtree:true,attributes:true,attributeFilter:['src']});
+  }catch(e){}
   var nativePushState=history.pushState,nativeReplaceState=history.replaceState;
   history.pushState=function(){var args=Array.prototype.slice.call(arguments);if(args.length>2&&args[2]!=null)args[2]=withTabUrl(args[2]);return nativePushState.apply(this,args);};
   history.replaceState=function(){var args=Array.prototype.slice.call(arguments);if(args.length>2&&args[2]!=null)args[2]=withTabUrl(args[2]);return nativeReplaceState.apply(this,args);};
